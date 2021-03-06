@@ -36,7 +36,7 @@ use rnix::{
     parser::*,
     types::*,
     value::{Anchor as RAnchor, Value as RValue},
-    SyntaxNode,
+    SyntaxNode, TextRange, TextSize,
 };
 use std::{
     collections::HashMap,
@@ -135,11 +135,7 @@ impl App {
                     let id = req.id.clone();
                     match self.conn.handle_shutdown(&req) {
                         Ok(true) => break,
-                        Ok(false) => {
-                            if let Err(err) = self.handle_request(req) {
-                                self.err(id, err);
-                            }
-                        }
+                        Ok(false) => self.handle_request(req),
                         Err(err) => {
                             // This only fails if a shutdown was
                             // requested in the first place, so it
@@ -157,7 +153,7 @@ impl App {
             }
         }
     }
-    fn handle_request(&mut self, req: Request) -> Result<(), Error> {
+    fn handle_request(&mut self, req: Request) {
         fn cast<Kind>(req: &mut Option<Request>) -> Option<(RequestId, Kind::Params)>
         where
             Kind: RequestTrait,
@@ -198,14 +194,10 @@ impl App {
         } else if let Some((id, params)) = cast::<Formatting>(&mut req) {
             let changes = if let Some((ast, code)) = self.files.get(&params.text_document.uri) {
                 let fmt = nixpkgs_fmt::reformat_node(&ast.node());
-                fmt.text_diff()
-                    .iter()
-                    .filter(|range| !range.delete.is_empty() || !range.insert.is_empty())
-                    .map(|edit| TextEdit {
-                        range: utils::range(&code, edit.delete),
-                        new_text: edit.insert.to_string(),
-                    })
-                    .collect()
+                vec![TextEdit {
+                    range: utils::range(&code, TextRange::up_to(ast.node().text().len())),
+                    new_text: fmt.text().to_string(),
+                }]
             } else {
                 Vec::new()
             };
@@ -218,8 +210,15 @@ impl App {
                 }
             }
             self.reply(Response::new_ok(id, selections));
+        } else {
+            let req = req.expect("internal error: req should have been wrapped in Some");
+
+            self.reply(Response::new_err(
+                req.id,
+                ErrorCode::MethodNotFound as i32,
+                format!("Unhandled method {}", req.method),
+            ))
         }
-        Ok(())
     }
     fn handle_notification(&mut self, req: Notification) -> Result<(), Error> {
         match &*req.method {
@@ -375,9 +374,19 @@ impl App {
         let errors = ast.errors();
         let mut diagnostics = Vec::with_capacity(errors.len());
         for err in errors {
-            if let ParseError::Unexpected(node) = err {
+            let node_range = match err {
+                ParseError::Unexpected(range)
+                | ParseError::UnexpectedDoubleBind(range)
+                | ParseError::UnexpectedExtra(range)
+                | ParseError::UnexpectedWanted(_, range, _) => Some(range),
+                ParseError::UnexpectedEOF | ParseError::UnexpectedEOFWanted(_) => {
+                    Some(TextRange::at(TextSize::of(code), TextSize::from(0)))
+                }
+                _ => None,
+            };
+            if let Some(node_range) = node_range {
                 diagnostics.push(Diagnostic {
-                    range: utils::range(code, node),
+                    range: utils::range(code, node_range),
                     severity: Some(DiagnosticSeverity::Error),
                     message: err.to_string(),
                     ..Diagnostic::default()
